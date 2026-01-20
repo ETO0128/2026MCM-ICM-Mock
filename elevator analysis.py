@@ -1,1090 +1,891 @@
-"""
-MCM Problem B: Elevator Traffic Analysis and NHPP Modeling
-Final Robust Version - Fixed Index Error
-Author: [Your Name]
-Date: 2024
-"""
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, timedelta
+from pathlib import Path
 import warnings
-from scipy import stats
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
-import os
-import gc
-import re
+from datetime import datetime, timedelta
+import json
 
 warnings.filterwarnings('ignore')
 
-# Set style for better visualizations
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
+# =================配置区域=================
+plt.style.use('ggplot')
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
 
-class ElevatorDataAnalyzer:
-    """Main class for elevator data analysis and NHPP modeling"""
+# 常量配置
+AVG_PERSON_WEIGHT = 70  # 假设平均每人70kg
+TIME_SLOT_MINUTES = 5  # 时间分析粒度（分钟）
 
-    def __init__(self, data_folder='./data'):
-        """Initialize the analyzer with data folder path"""
-        self.data_folder = data_folder
-        self.hall_calls = None
-        self.car_calls = None
-        self.car_stops = None
-        self.car_departures = None
-        self.load_changes = None
-        self.maintenance_mode = None
-        self.day_types = None
 
-    def _parse_datetime_flexible(self, datetime_str):
-        """Robust datetime parser for various formats"""
-        if pd.isna(datetime_str):
-            return None
+# =========================================
 
+def get_data_path():
+    """智能定位data文件夹"""
+    current_dir = Path(__file__).parent.absolute()
+
+    # 尝试多种可能的路径
+    possible_paths = [
+        current_dir / 'data',
+        current_dir,
+        current_dir.parent / 'data',
+        Path.cwd() / 'data'
+    ]
+
+    for path in possible_paths:
+        if path.exists() and any(path.glob('*.csv')):
+            return path
+
+    raise FileNotFoundError(f"❌ 找不到数据文件夹")
+
+
+def load_and_clean(file_path, cols=None, parse_dates=['Time']):
+    """
+    读取CSV文件，自动处理中文编码
+    """
+    print(f"正在读取: {file_path.name}")
+
+    encodings = ['gb18030', 'gbk', 'utf-8-sig', 'ansi', 'utf-8']
+
+    for enc in encodings:
         try:
-            # Clean up the string
-            datetime_str = str(datetime_str).strip()
+            if cols:
+                df = pd.read_csv(file_path, usecols=cols, encoding=enc)
+            else:
+                df = pd.read_csv(file_path, encoding=enc)
+            print(f"  -> 成功使用 [{enc}] 编码")
 
-            # Replace multiple spaces with single space
-            datetime_str = re.sub(r'\s+', ' ', datetime_str)
+            # 清理列名
+            df.columns = df.columns.str.strip()
 
-            # Split into date and time parts
-            parts = datetime_str.split(' ')
-            if len(parts) < 2:
-                return None
-
-            date_part = parts[0]
-            time_part = parts[1]
-
-            # Parse date (handle YYYY/MM/DD or YYYY/M/D)
-            date_parts = date_part.split('/')
-            year = int(date_parts[0])
-            month = int(date_parts[1])
-            day = int(date_parts[2]) if len(date_parts) > 2 else 1
-
-            # Parse time (handle H:MM:SS or HH:MM:SS)
-            time_parts = time_part.split(':')
-            hour = int(time_parts[0]) if time_parts[0] else 0
-            minute = int(time_parts[1]) if len(time_parts) > 1 and time_parts[1] else 0
-            second = int(time_parts[2]) if len(time_parts) > 2 and time_parts[2] else 0
-
-            return datetime(year, month, day, hour, minute, second)
-
-        except (ValueError, IndexError, AttributeError) as e:
-            print(f"Warning: Could not parse datetime: '{datetime_str}' - {e}")
-            return None
-
-    def load_data_safely(self):
-        """Load all CSV files safely, handling missing files and errors"""
-        print("Loading data files with safe parsing...")
-
-        # Define required files and their columns
-        files_to_load = {
-            'hall_calls.csv': ['Time', 'Elevator ID', 'Direction', 'Floor'],
-            'car_calls.csv': ['Time', 'Elevator ID', 'Floor', 'Action'],
-            'car_stops.csv': ['Time', 'Elevator ID', 'Floor', 'Direction'],
-            'car_departures.csv': ['Time', 'Elevator ID', 'Floor'],
-            'load_changes.csv': ['Time', 'Elevator ID', 'Floor', 'Load In (kg)', 'Load Out (kg)'],
-            'maintenance_mode.csv': ['Time', 'Elevator ID', 'Mode', 'Action']
-        }
-
-        # Initialize all dataframes as empty
-        self.hall_calls = pd.DataFrame()
-        self.car_calls = pd.DataFrame()
-        self.car_stops = pd.DataFrame()
-        self.car_departures = pd.DataFrame()
-        self.load_changes = pd.DataFrame()
-        self.maintenance_mode = pd.DataFrame()
-
-        successful_loads = 0
-
-        for filename, usecols in files_to_load.items():
-            filepath = os.path.join(self.data_folder, filename)
-
-            if not os.path.exists(filepath):
-                print(f"  Warning: {filename} not found at {filepath}")
-                continue
-
-            try:
-                df = self._load_single_file_safe(filename, usecols)
-
-                # Assign to appropriate attribute
-                if filename == 'hall_calls.csv':
-                    self.hall_calls = df
-                elif filename == 'car_calls.csv':
-                    self.car_calls = df
-                elif filename == 'car_stops.csv':
-                    self.car_stops = df
-                elif filename == 'car_departures.csv':
-                    self.car_departures = df
-                elif filename == 'load_changes.csv':
-                    self.load_changes = df
-                elif filename == 'maintenance_mode.csv':
-                    self.maintenance_mode = df
-
-                if len(df) > 0:
-                    successful_loads += 1
-                    print(f"  ✓ {filename}: {len(df):,} rows loaded")
-                else:
-                    print(f"  ⚠ {filename}: 0 rows loaded (file may be empty or invalid)")
-
-            except Exception as e:
-                print(f"  ✗ Error loading {filename}: {str(e)[:100]}...")
-
-        print(f"\nSuccessfully loaded {successful_loads}/{len(files_to_load)} files")
-
-        # Check if we have the essential data
-        if len(self.hall_calls) == 0:
-            print("\n⚠ Warning: No hall_calls data loaded. Analysis may be limited.")
-            return False
-
-        print(f"\nhall_calls shape: {self.hall_calls.shape}")
-        print(f"car_calls shape: {self.car_calls.shape}")
-        print(f"car_stops shape: {self.car_stops.shape}")
-        print(f"car_departures shape: {self.car_departures.shape}")
-        print(f"load_changes shape: {self.load_changes.shape}")
-        print(f"maintenance_mode shape: {self.maintenance_mode.shape}")
-
-        return True
-
-    def _load_single_file_safe(self, filename, usecols):
-        """Load a single CSV file safely with error handling"""
-        filepath = os.path.join(self.data_folder, filename)
-
-        try:
-            # First, try to read the file with minimal preprocessing
-            df = pd.read_csv(filepath, usecols=usecols, dtype=str, low_memory=False,
-                            on_bad_lines='skip', encoding_errors='ignore')
-
-            if len(df) == 0:
-                return pd.DataFrame()
-
-            # Parse datetime column
+            # 如果有Time列，转换为datetime类型
             if 'Time' in df.columns:
-                # Try to parse dates, handling errors gracefully
-                parsed_times = []
-                invalid_count = 0
+                df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
+                # 删除时间解析失败的行
+                df = df.dropna(subset=['Time'])
+                df = df.sort_values('Time').reset_index(drop=True)
 
-                for time_str in df['Time'].astype(str):
-                    parsed_time = self._parse_datetime_flexible(time_str)
-                    if parsed_time is not None:
-                        parsed_times.append(parsed_time)
-                    else:
-                        parsed_times.append(None)
-                        invalid_count += 1
+            # 标准化数据类型
+            if 'Floor' in df.columns:
+                # 尝试将Floor转换为数值类型
+                df['Floor'] = pd.to_numeric(df['Floor'], errors='coerce')
+                df = df.dropna(subset=['Floor'])
+                df['Floor'] = df['Floor'].astype(int)
 
-                if invalid_count > 0:
-                    print(f"    {invalid_count}/{len(df)} datetime values could not be parsed in {filename}")
-
-                df['Time'] = parsed_times
-
-                # Remove rows with invalid datetime
-                initial_len = len(df)
-                df = df[df['Time'].notna()]
-                if initial_len - len(df) > 0:
-                    print(f"    Removed {initial_len - len(df)} rows with invalid datetime from {filename}")
-
-            # Convert other columns safely
-            for col in df.columns:
-                if col == 'Time':
-                    continue
-
-                # Handle numeric columns
-                if col in ['Floor', 'Load In (kg)', 'Load Out (kg)']:
-                    # First convert to numeric, coercing errors to NaN
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-
-                    # Fill NaN values appropriately
-                    if col == 'Floor':
-                        # For Floor, replace NaN with 1 (ground floor)
-                        df[col] = df[col].fillna(1).astype(int)
-                        # Ensure floor values are reasonable
-                        df.loc[df[col] < 1, col] = 1
-                    else:
-                        # For load values, fill NaN with 0
-                        df[col] = df[col].fillna(0).astype(float)
-
-                # Handle categorical columns
-                elif col in ['Elevator ID', 'Direction', 'Action', 'Mode']:
-                    # Fill NaN with appropriate defaults
-                    if col == 'Direction':
-                        df[col] = df[col].fillna('Unknown').astype('category')
-                    else:
-                        df[col] = df[col].fillna('').astype('category')
+            if 'Elevator ID' in df.columns:
+                df['Elevator ID'] = df['Elevator ID'].astype(str).str.strip()
 
             return df
 
         except Exception as e:
-            print(f"    Detailed error loading {filename}: {str(e)}")
-            return pd.DataFrame()
-
-    def preprocess_data(self):
-        """Preprocess the data with error handling"""
-        print("\nPreprocessing data...")
-
-        # Create a list of dataframes to process
-        dataframes = [
-            ('hall_calls', self.hall_calls),
-            ('car_calls', self.car_calls),
-            ('car_stops', self.car_stops),
-            ('load_changes', self.load_changes)
-        ]
-
-        for name, df in dataframes:
-            if df is not None and len(df) > 0 and 'Time' in df.columns:
-                print(f"  Processing {name}...")
-
-                try:
-                    # Extract date and time components
-                    df['Date'] = df['Time'].dt.date
-                    df['Hour'] = df['Time'].dt.hour
-                    df['Minute'] = df['Time'].dt.minute
-                    df['Second'] = df['Time'].dt.second
-
-                    # Create 5-minute time slices (288 per day)
-                    df['5min_slice'] = (df['Hour'] * 60 + df['Minute']) // 5
-
-                    # Extract day of week
-                    df['DayOfWeek'] = df['Time'].dt.dayofweek
-                    df['IsWeekend'] = df['DayOfWeek'].isin([5, 6])
-
-                    print(f"    Successfully processed {len(df):,} rows")
-
-                except Exception as e:
-                    print(f"    Error processing {name}: {str(e)}")
-            else:
-                print(f"  Skipping {name}: No data or missing Time column")
-
-        print("Data preprocessing completed.")
-
-    def analyze_traffic_patterns(self):
-        """Analyze traffic patterns for day type classification"""
-        print("\nAnalyzing traffic patterns for day type classification...")
-
-        if self.hall_calls is None or len(self.hall_calls) == 0:
-            print("Error: No hall_calls data available for analysis!")
-            return None
-
-        try:
-            # Extract daily features
-            daily_features = self._extract_daily_features()
-
-            if len(daily_features) < 3:  # Need at least 3 days for meaningful clustering
-                print(f"Warning: Only {len(daily_features)} days of data. Using simplified classification.")
-                return self._simple_day_classification(daily_features)
-
-            # Cluster days
-            day_types = self._cluster_days(daily_features)
-
-            # Analyze characteristics
-            self._analyze_cluster_characteristics(daily_features, day_types)
-
-            self.day_types = day_types
-            return day_types
-
-        except Exception as e:
-            print(f"Error in traffic pattern analysis: {str(e)}")
-            return self._simple_day_classification()
-
-    def _simple_day_classification(self, daily_features=None):
-        """Simple day classification based on day of week"""
-        print("Using simple day of week classification...")
-
-        if daily_features is None and self.hall_calls is not None:
-            # Extract dates from hall_calls
-            dates = sorted(self.hall_calls['Date'].unique())
-            daily_features = pd.DataFrame({'Date': dates})
-
-        if daily_features is None or len(daily_features) == 0:
-            return pd.DataFrame(columns=['Date', 'DayType', 'Cluster'])
-
-        # Classify based on day of week
-        def classify_by_weekday(date):
-            # Monday=0, Sunday=6
-            weekday = date.weekday()
-            return 'Weekday' if weekday < 5 else 'Holiday'
-
-        daily_features['DayType'] = daily_features['Date'].apply(classify_by_weekday)
-        daily_features['Cluster'] = daily_features['DayType'].apply(lambda x: 0 if x == 'Weekday' else 1)
-
-        self.day_types = daily_features[['Date', 'DayType', 'Cluster']]
-        return self.day_types
-
-    def _extract_daily_features(self):
-        """Extract features for each day"""
-
-        # Get unique dates
-        dates = sorted(self.hall_calls['Date'].unique())
-        print(f"Found {len(dates)} unique days")
-
-        features_list = []
-
-        for i, date in enumerate(dates):
-            try:
-                # Filter data for this date
-                date_mask = self.hall_calls['Date'] == date
-                date_data = self.hall_calls[date_mask]
-
-                if len(date_data) == 0:
-                    continue
-
-                # Calculate basic features
-                total_calls = len(date_data)
-
-                # Time distribution features
-                hours = date_data['Hour'].values
-                morning_peak = np.sum((hours >= 8) & (hours < 10)) / total_calls if total_calls > 0 else 0
-                evening_peak = np.sum((hours >= 17) & (hours < 19)) / total_calls if total_calls > 0 else 0
-                lunch_peak = np.sum((hours >= 12) & (hours < 14)) / total_calls if total_calls > 0 else 0
-                night_ratio = np.sum((hours >= 20) | (hours < 6)) / total_calls if total_calls > 0 else 0
-
-                # Direction features
-                if 'Direction' in date_data.columns:
-                    up_ratio = (date_data['Direction'] == 'Up').sum() / total_calls if total_calls > 0 else 0
-                    down_ratio = (date_data['Direction'] == 'Down').sum() / total_calls if total_calls > 0 else 0
-                else:
-                    up_ratio = down_ratio = 0.5
-
-                # Calculate hourly distribution for peakiness
-                hourly_counts = date_data.groupby('Hour').size()
-                if len(hourly_counts) > 1:
-                    probs = hourly_counts.values / hourly_counts.values.sum()
-                    peakiness = stats.kurtosis(probs, fisher=False)
-
-                    # Calculate uniformity (entropy)
-                    entropy = -np.sum(probs * np.log(probs + 1e-10))
-                    max_entropy = np.log(len(probs))
-                    uniformity = entropy / max_entropy if max_entropy > 0 else 0
-                else:
-                    peakiness = 0
-                    uniformity = 0
-
-                features = {
-                    'Date': date,
-                    'TotalCalls': total_calls,
-                    'MorningPeak_8_10': morning_peak,
-                    'EveningPeak_17_19': evening_peak,
-                    'LunchPeak_12_14': lunch_peak,
-                    'NightRatio_20_6': night_ratio,
-                    'UpRatio': up_ratio,
-                    'DownRatio': down_ratio,
-                    'Peakiness': peakiness,
-                    'Uniformity': uniformity
-                }
-
-                features_list.append(features)
-
-                if i % 10 == 0 and i > 0:
-                    print(f"    Processed {i+1}/{len(dates)} days")
-
-            except Exception as e:
-                print(f"    Error processing date {date}: {str(e)}")
-                continue
-
-        if not features_list:
-            return pd.DataFrame()
-
-        return pd.DataFrame(features_list)
-
-    def _cluster_days(self, daily_features):
-        """Cluster days into Weekday and Holiday patterns"""
-
-        # Select features for clustering
-        feature_cols = ['MorningPeak_8_10', 'EveningPeak_17_19',
-                       'LunchPeak_12_14', 'NightRatio_20_6',
-                       'UpRatio', 'Peakiness', 'Uniformity']
-
-        # Check if we have the required features
-        available_cols = [col for col in feature_cols if col in daily_features.columns]
-
-        if len(available_cols) < 3:
-            print(f"Warning: Only {len(available_cols)} features available. Using all available features.")
-            feature_cols = available_cols
-
-        if len(feature_cols) == 0 or len(daily_features) < 2:
-            print("Not enough features or data for clustering!")
-            return self._simple_day_classification(daily_features)
-
-        try:
-            X = daily_features[feature_cols].values
-
-            # Handle NaN values
-            X = np.nan_to_num(X, nan=0.0)
-
-            # Standardize features
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
-
-            # Apply K-means
-            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-            clusters = kmeans.fit_predict(X_scaled)
-
-            # Calculate silhouette score if we have multiple clusters
-            unique_clusters = np.unique(clusters)
-            if len(unique_clusters) > 1:
-                silhouette_avg = silhouette_score(X_scaled, clusters)
-                print(f"Clustering silhouette score: {silhouette_avg:.3f}")
-            else:
-                print("Warning: Only one cluster found!")
-
-            # Assign clusters
-            daily_features['Cluster'] = clusters
-
-            # Determine which cluster is Weekday vs Holiday
-            # Based on morning peak intensity (weekdays should have higher morning peaks)
-            cluster_stats = []
-            for cluster_id in [0, 1]:
-                if cluster_id in daily_features['Cluster'].values:
-                    cluster_data = daily_features[daily_features['Cluster'] == cluster_id]
-                    stats_dict = {
-                        'Cluster': cluster_id,
-                        'MorningPeak_Mean': cluster_data['MorningPeak_8_10'].mean(),
-                        'Size': len(cluster_data)
-                    }
-                    cluster_stats.append(stats_dict)
-
-            if cluster_stats:
-                cluster_stats_df = pd.DataFrame(cluster_stats)
-                weekday_cluster = cluster_stats_df.loc[cluster_stats_df['MorningPeak_Mean'].idxmax(), 'Cluster']
-
-                # Assign day types
-                daily_features['DayType'] = daily_features['Cluster'].apply(
-                    lambda x: 'Weekday' if x == weekday_cluster else 'Holiday'
-                )
-            else:
-                daily_features['DayType'] = 'Weekday'  # Default
-
-            return daily_features[['Date', 'DayType', 'Cluster']]
-
-        except Exception as e:
-            print(f"Error in clustering: {str(e)}")
-            return self._simple_day_classification(daily_features)
-
-    def _analyze_cluster_characteristics(self, daily_features, day_types):
-        """Analyze cluster characteristics"""
-
-        print("\n" + "="*60)
-        print("DAY TYPE CHARACTERISTICS ANALYSIS")
-        print("="*60)
-
-        # Merge features with day types
-        merged_df = pd.merge(daily_features, day_types, on='Date')
-
-        for day_type in ['Weekday', 'Holiday']:
-            type_data = merged_df[merged_df['DayType'] == day_type]
-
-            if len(type_data) == 0:
-                print(f"\nNo {day_type} data found!")
-                continue
-
-            print(f"\n{day_type} Characteristics ({len(type_data)} days):")
-            print("-" * 40)
-
-            metrics = {
-                'Morning Peak (8-10) Ratio': type_data['MorningPeak_8_10'].mean(),
-                'Evening Peak (17-19) Ratio': type_data['EveningPeak_17_19'].mean(),
-                'Lunch Peak (12-14) Ratio': type_data['LunchPeak_12_14'].mean(),
-                'Night Activity (20-6) Ratio': type_data['NightRatio_20_6'].mean(),
-                'Up/Down Ratio': type_data['UpRatio'].mean(),
-                'Peakiness (Kurtosis)': type_data['Peakiness'].mean(),
-                'Uniformity (Entropy)': type_data['Uniformity'].mean(),
-                'Avg Daily Calls': type_data['TotalCalls'].mean(),
-            }
-
-            for metric, value in metrics.items():
-                print(f"  {metric:30}: {value:.3f}")
-
-    def run_analysis(self):
-        """Run the complete analysis pipeline"""
-
-        print("="*60)
-        print("MCM PROBLEM B: ELEVATOR TRAFFIC ANALYSIS")
-        print("="*60)
-
-        import time
-        start_time = time.time()
-
-        # Step 1: Load data
-        print("\n[Step 1/6] Loading data...")
-        if not self.load_data_safely():
-            print("Failed to load essential data. Exiting.")
-            return
-
-        # Step 2: Preprocess data
-        print("\n[Step 2/6] Preprocessing data...")
-        self.preprocess_data()
-
-        # Step 3: Analyze patterns
-        print("\n[Step 3/6] Analyzing traffic patterns...")
-        self.analyze_traffic_patterns()
-
-        # Only proceed if we have hall_calls data
-        if self.hall_calls is None or len(self.hall_calls) == 0:
-            print("No hall_calls data available for further analysis.")
-            return
-
-        # Step 4: Fit NHPP models
-        print("\n[Step 4/6] Fitting NHPP models...")
-        train_dates, val_dates = self._fit_nhpp_models(train_days=20)
-
-        # Step 5: Validate models
-        print("\n[Step 5/6] Validating models...")
-        if val_dates and hasattr(self, 'nhpp_models'):
-            self.validation_results = self._validate_models(val_dates)
+            continue
+
+    print(f"❌ 无法读取 {file_path.name}")
+    return None
+
+
+def estimate_passenger_count(load_changes_df):
+    """
+    根据重量变化估算乘客数量
+    """
+    if load_changes_df is None or load_changes_df.empty:
+        return pd.DataFrame()
+
+    df = load_changes_df.copy()
+
+    # 确保数值列是数值类型
+    for col in ['Load In (kg)', 'Load Out (kg)']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # 计算进出乘客数
+    df['Passengers_In'] = df['Load In (kg)'] / AVG_PERSON_WEIGHT
+    df['Passengers_Out'] = df['Load Out (kg)'] / AVG_PERSON_WEIGHT
+
+    # 四舍五入到最近的整数
+    df['Passengers_In'] = df['Passengers_In'].round().astype(int)
+    df['Passengers_Out'] = df['Passengers_Out'].round().astype(int)
+    df['Net_Passengers'] = df['Passengers_In'] - df['Passengers_Out']
+
+    # 添加时间特征
+    df['Hour'] = df['Time'].dt.hour
+    df['Minute'] = df['Time'].dt.minute
+    df['Time_Slot'] = df['Time'].dt.floor(f'{TIME_SLOT_MINUTES}min')
+
+    return df
+
+
+def calculate_wait_times_simple(hall_calls, car_stops):
+    """
+    简化的等待时间计算方法
+    """
+    print("\n[计算等待时间 - 简化方法]")
+
+    if hall_calls.empty or car_stops.empty:
+        print("❌ 数据为空，无法计算等待时间")
+        return pd.DataFrame()
+
+    # 确保数据类型一致
+    hall_calls = hall_calls.copy()
+    car_stops = car_stops.copy()
+
+    # 标准化数据类型
+    hall_calls['Floor'] = hall_calls['Floor'].astype(int)
+    car_stops['Floor'] = car_stops['Floor'].astype(int)
+
+    # 确保数据已排序
+    hall_calls = hall_calls.sort_values('Time')
+    car_stops = car_stops.sort_values('Time')
+
+    # 为每个呼叫寻找匹配的停靠
+    wait_times = []
+
+    # 按电梯分组处理
+    for elevator in hall_calls['Elevator ID'].unique():
+        hall_elev = hall_calls[hall_calls['Elevator ID'] == elevator]
+        stop_elev = car_stops[car_stops['Elevator ID'] == elevator]
+
+        if hall_elev.empty or stop_elev.empty:
+            continue
+
+        # 对每个呼叫，找到同楼层、同方向、时间最近的停靠
+        for _, hall_row in hall_elev.iterrows():
+            call_time = hall_row['Time']
+            floor = hall_row['Floor']
+            direction = hall_row['Direction']
+
+            # 找到符合条件的停靠
+            matching = stop_elev[
+                (stop_elev['Floor'] == floor) &
+                (stop_elev['Direction'] == direction) &
+                (stop_elev['Time'] >= call_time)
+                ]
+
+            if not matching.empty:
+                stop_time = matching.iloc[0]['Time']
+                wait_seconds = (stop_time - call_time).total_seconds()
+
+                # 过滤合理范围
+                if 1 <= wait_seconds <= 900:
+                    wait_times.append({
+                        'Time_call': call_time,
+                        'Floor': floor,
+                        'Direction': direction,
+                        'Elevator_ID': elevator,
+                        'Time_stop': stop_time,
+                        'Wait_Time': wait_seconds
+                    })
+
+    if wait_times:
+        result = pd.DataFrame(wait_times)
+        avg_wait = result['Wait_Time'].mean()
+        print(f"✅ 平均等待时间: {avg_wait:.2f}秒")
+        print(f"✅ 有效等待记录: {len(result)}条")
+        return result
+    else:
+        print("❌ 未能计算等待时间")
+        return pd.DataFrame()
+
+
+def analyze_traffic_patterns(hall_calls, time_slot_minutes=5):
+    """
+    按时间槽分析流量模式
+    """
+    print(f"\n[流量模式分析] 时间粒度: {time_slot_minutes}分钟")
+
+    if hall_calls.empty:
+        print("❌ 无大厅呼叫数据")
+        return pd.DataFrame()
+
+    df = hall_calls.copy()
+
+    # 创建时间槽
+    df['Time_Slot'] = df['Time'].dt.floor(f'{time_slot_minutes}min')
+
+    # 按时间槽统计
+    time_slot_stats = df.groupby('Time_Slot').agg({
+        'Floor': 'count',  # 呼叫次数
+    }).rename(columns={'Floor': 'Call_Count'})
+
+    # 统计上行下行比例
+    up_counts = df[df['Direction'] == 'Up'].groupby('Time_Slot').size()
+    down_counts = df[df['Direction'] == 'Down'].groupby('Time_Slot').size()
+
+    time_slot_stats['Up_Count'] = time_slot_stats.index.map(lambda x: up_counts.get(x, 0))
+    time_slot_stats['Down_Count'] = time_slot_stats.index.map(lambda x: down_counts.get(x, 0))
+
+    # 计算上行比例
+    time_slot_stats['Up_Ratio'] = time_slot_stats.apply(
+        lambda row: row['Up_Count'] / row['Call_Count'] if row['Call_Count'] > 0 else 0,
+        axis=1
+    )
+
+    # 添加小时和分钟信息
+    time_slot_stats['Hour'] = time_slot_stats.index.hour
+    time_slot_stats['Minute'] = time_slot_stats.index.minute
+
+    print(f"✅ 流量模式分析完成: {len(time_slot_stats)}个时间槽")
+    return time_slot_stats
+
+
+def analyze_floor_demand(hall_calls, car_calls):
+    """
+    分析楼层需求（作为起点和终点）
+    """
+    print("\n[楼层需求分析]")
+
+    # 作为起点的楼层（大厅呼叫）
+    if hall_calls.empty:
+        start_floors = pd.Series(dtype=int)
+    else:
+        start_floors = hall_calls['Floor'].value_counts().sort_index()
+
+    # 作为终点的楼层（轿厢呼叫）
+    if car_calls is None or car_calls.empty:
+        end_floors = pd.Series(dtype=int)
+    else:
+        # 只考虑注册的呼叫
+        if 'Action' in car_calls.columns:
+            registered_calls = car_calls[car_calls['Action'] == 'Register']
+            end_floors = registered_calls['Floor'].value_counts().sort_index()
         else:
-            print("Skipping validation - no validation data or models available")
+            end_floors = car_calls['Floor'].value_counts().sort_index()
 
-        # Step 6: Create visualizations
-        print("\n[Step 6/6] Creating visualizations...")
-        self._create_visualizations()
+    print(f"✅ 起点楼层分析: {len(start_floors)}个楼层")
+    if not end_floors.empty:
+        print(f"✅ 终点楼层分析: {len(end_floors)}个楼层")
 
-        # Save results
-        print("\nSaving analysis results...")
-        self._save_results()
+    return start_floors, end_floors
 
-        total_time = time.time() - start_time
-        print(f"\nAnalysis completed in {total_time:.2f} seconds!")
-        print("="*60)
 
-    def _fit_nhpp_models(self, train_days=20):
-        """Fit NHPP models for Weekday and Holiday patterns"""
-        print("\n" + "="*60)
-        print("FITTING NON-HOMOGENEOUS POISSON PROCESS MODELS")
-        print("="*60)
+def classify_traffic_mode(time_slot_stats):
+    """
+    根据流量特征分类交通模式
+    """
+    if time_slot_stats.empty:
+        return time_slot_stats
 
-        if self.day_types is None or len(self.day_types) == 0:
-            print("Error: Day types not classified yet!")
-            return [], []
+    print("\n[交通模式分类]")
 
-        # Get all dates from hall_calls
-        all_dates = sorted(self.hall_calls['Date'].unique())
+    modes = []
 
-        if len(all_dates) < 10:
-            print(f"Warning: Only {len(all_dates)} days of data available.")
-            train_days = min(train_days, len(all_dates))
-            val_dates = []
+    for idx, row in time_slot_stats.iterrows():
+        hour = row['Hour']
+        up_ratio = row['Up_Ratio']
+        call_count = row['Call_Count']
+
+        # 根据规则分类
+        if call_count == 0:
+            mode = '无流量'
+        elif call_count <= 1:
+            mode = '极低流量'
+        elif 7 <= hour < 9 and up_ratio > 0.7:
+            mode = '早晨上行高峰'
+        elif 17 <= hour < 19 and up_ratio < 0.3:
+            mode = '晚间下行高峰'
+        elif 11 <= hour < 13 and 0.4 <= up_ratio <= 0.6:
+            mode = '午餐时段'
+        elif call_count >= 5:
+            mode = '高流量'
         else:
-            train_days = min(train_days, len(all_dates) - 5)  # Leave at least 5 days for validation
-            val_dates = all_dates[train_days:train_days+5] if len(all_dates) > train_days else []
+            mode = '正常流量'
 
-        train_dates = all_dates[:train_days]
+        modes.append(mode)
 
-        print(f"Training on {len(train_dates)} days: {train_dates[0]} to {train_dates[-1]}")
-        if val_dates:
-            print(f"Validating on {len(val_dates)} days: {val_dates[0]} to {val_dates[-1]}")
-        else:
-            print("No validation data available!")
+    time_slot_stats['Traffic_Mode'] = modes
 
-        # Get day types for training dates
-        train_day_types = self.day_types[self.day_types['Date'].isin(train_dates)]
+    # 统计各模式占比
+    mode_counts = time_slot_stats['Traffic_Mode'].value_counts()
+    for mode, count in mode_counts.items():
+        percentage = count / len(time_slot_stats) * 100
+        print(f"  {mode}: {count}个时间槽 ({percentage:.1f}%)")
 
-        # Initialize NHPP models
-        self.nhpp_models = {
-            'Weekday': NHPP_Model(),
-            'Holiday': NHPP_Model()
-        }
+    return time_slot_stats
 
-        # Fit models for each day type
-        for day_type in ['Weekday', 'Holiday']:
-            print(f"\nFitting NHPP model for {day_type}...")
 
-            # Get dates of this type in training set
-            type_dates = train_day_types[train_day_types['DayType'] == day_type]['Date']
+def generate_statistics_report(data_frames, output_path):
+    """
+    生成详细的统计报告 - 修复版，处理Series对象
+    """
+    print(f"\n[生成统计报告] {output_path}")
 
-            if len(type_dates) == 0:
-                print(f"  Warning: No {day_type} data in training set!")
-                continue
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 60 + "\n")
+        f.write("电梯系统运行统计分析报告\n")
+        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n\n")
 
-            # Prepare arrival data
-            arrival_data = self._prepare_arrival_data(type_dates)
+        # 1. 数据集概览
+        f.write("1. 数据集概览\n")
+        f.write("-" * 40 + "\n")
 
-            # Fit NHPP model
-            self.nhpp_models[day_type].fit(arrival_data)
+        # 只处理DataFrame对象
+        for name, data in data_frames.items():
+            if isinstance(data, pd.DataFrame) and not data.empty:
+                f.write(f"{name}:\n")
+                f.write(f"  记录数: {len(data):,}\n")
 
-            print(f"  Fitted model with {len(type_dates)} days of data")
-            print(f"  Mean arrival rate: {self.nhpp_models[day_type].lambda_t.mean():.2f} passengers/5min")
+                if 'Time' in data.columns:
+                    f.write(f"  时间范围: {data['Time'].min()} 到 {data['Time'].max()}\n")
+                    # 计算天数
+                    time_range = data['Time'].max() - data['Time'].min()
+                    f.write(f"  天数: {time_range.days + 1}天\n")
 
-        return train_dates, val_dates
+                if 'Elevator ID' in data.columns:
+                    elevators = data['Elevator ID'].unique()
+                    f.write(f"  电梯数量: {len(elevators)}\n")
 
-    def _prepare_arrival_data(self, dates):
-        """Prepare arrival count data for given dates - FIXED VERSION"""
+                if 'Floor' in data.columns:
+                    floors = data['Floor'].unique()
+                    if len(floors) > 0:
+                        f.write(f"  涉及楼层: {len(floors)}层 (最低{min(floors)}, 最高{max(floors)})\n")
 
-        arrival_counts = []
+                f.write("\n")
+            elif isinstance(data, pd.Series) and not data.empty:
+                f.write(f"{name} (统计序列):\n")
+                f.write(f"  条目数: {len(data):,}\n")
+                f.write(f"  总计: {data.sum():,}\n")
+                f.write("\n")
 
-        for date in dates:
-            # Filter hall calls for this date
-            date_mask = self.hall_calls['Date'] == date
-            date_data = self.hall_calls[date_mask]
+        # 2. 等待时间分析
+        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
+            'wait_times'].empty:
+            wait_df = data_frames['wait_times']
+            f.write("2. 等待时间分析\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"总记录数: {len(wait_df):,}\n")
+            f.write(f"平均等待时间: {wait_df['Wait_Time'].mean():.2f}秒\n")
+            f.write(f"中位数等待时间: {wait_df['Wait_Time'].median():.2f}秒\n")
+            f.write(f"标准差: {wait_df['Wait_Time'].std():.2f}秒\n")
 
-            # Count arrivals per 5-minute slice
-            slices_counts = date_data.groupby('5min_slice').size()
+            # 百分位数
+            percentiles = [25, 50, 75, 90, 95]
+            for p in percentiles:
+                value = wait_df['Wait_Time'].quantile(p / 100)
+                f.write(f"{p}百分位数: {value:.1f}秒\n")
 
-            # Create full array for all 288 slices
-            full_counts = np.zeros(288, dtype=np.float32)
+            # 长等待统计（超过60秒）
+            long_waits = wait_df[wait_df['Wait_Time'] > 60]
+            if len(long_waits) > 0:
+                percentage = len(long_waits) / len(wait_df) * 100
+                f.write(f"长等待(>60秒)比例: {percentage:.1f}% ({len(long_waits)}次)\n")
+                f.write(f"最长等待: {wait_df['Wait_Time'].max():.1f}秒\n")
 
-            if len(slices_counts) > 0:
-                # Get indices and values
-                indices = slices_counts.index.astype(int)
-                values = slices_counts.values
+            # 按电梯统计
+            if 'Elevator_ID' in wait_df.columns:
+                f.write("\n按电梯统计:\n")
+                for elevator in sorted(wait_df['Elevator_ID'].unique()):
+                    elev_waits = wait_df[wait_df['Elevator_ID'] == elevator]['Wait_Time']
+                    f.write(f"  电梯{elevator}: {elev_waits.mean():.1f}秒 (N={len(elev_waits)})\n")
 
-                # Filter indices that are within bounds (0-287)
-                valid_mask = (indices >= 0) & (indices < 288)
-                valid_indices = indices[valid_mask]
-                valid_values = values[valid_mask]
+            f.write("\n")
 
-                # Assign values to corresponding indices
-                full_counts[valid_indices] = valid_values
+        # 3. 流量模式分析
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
+        data_frames['time_slot_stats'].empty:
+            ts_stats = data_frames['time_slot_stats']
+            f.write("3. 流量模式分析\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"时间分析粒度: {TIME_SLOT_MINUTES}分钟\n")
+            f.write(f"总时间槽数: {len(ts_stats)}\n")
+            f.write(f"总呼叫次数: {ts_stats['Call_Count'].sum():,}\n")
+            f.write(f"平均每槽呼叫数: {ts_stats['Call_Count'].mean():.2f}\n")
 
-            arrival_counts.append(full_counts)
+            # 高峰时段识别
+            if not ts_stats.empty:
+                top_slots = ts_stats.nlargest(5, 'Call_Count')
+                f.write("\n高峰时段(前5):\n")
+                for idx, row in top_slots.iterrows():
+                    f.write(f"  {idx.strftime('%H:%M')}: {row['Call_Count']}次呼叫 "
+                            f"(上行{row['Up_Count']}/下行{row['Down_Count']})\n")
 
-        if not arrival_counts:
-            return np.array([])
+            f.write("\n")
 
-        return np.array(arrival_counts)
+        # 4. 楼层需求分析
+        if 'start_floors' in data_frames:
+            f.write("4. 楼层需求分析\n")
+            f.write("-" * 40 + "\n")
 
-    def _validate_models(self, val_dates):
-        """Validate NHPP models on validation data"""
-        print("\n" + "="*60)
-        print("MODEL VALIDATION")
-        print("="*60)
+            start_floors = data_frames['start_floors']
 
-        if not hasattr(self, 'nhpp_models') or not val_dates:
-            print("No models or validation data available!")
-            return None
+            if isinstance(start_floors, pd.Series) and not start_floors.empty:
+                f.write("作为起点的热门楼层(前10):\n")
+                total_calls = start_floors.sum()
+                for floor, count in start_floors.head(10).items():
+                    percentage = count / total_calls * 100
+                    f.write(f"  楼层{floor}: {count}次 ({percentage:.1f}%)\n")
 
-        # Get day types for validation dates
-        val_day_types = self.day_types[self.day_types['Date'].isin(val_dates)]
+            if 'end_floors' in data_frames and isinstance(data_frames['end_floors'], pd.Series) and not data_frames[
+                'end_floors'].empty:
+                end_floors = data_frames['end_floors']
+                f.write("\n作为终点的热门楼层(前10):\n")
+                total_calls = end_floors.sum()
+                for floor, count in end_floors.head(10).items():
+                    percentage = count / total_calls * 100
+                    f.write(f"  楼层{floor}: {count}次 ({percentage:.1f}%)\n")
 
-        validation_results = []
+            f.write("\n")
 
-        for date in val_dates:
-            try:
-                # Get actual day type
-                day_type_row = val_day_types[val_day_types['Date'] == date]
-                if len(day_type_row) == 0:
-                    continue
+        # 5. 乘客流量估算
+        if 'passenger_flow' in data_frames and isinstance(data_frames['passenger_flow'], pd.DataFrame) and not \
+        data_frames['passenger_flow'].empty:
+            pass_df = data_frames['passenger_flow']
+            f.write("5. 乘客流量估算\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"总记录数: {len(pass_df):,}\n")
+            f.write(f"估算总进客数: {pass_df['Passengers_In'].sum():.0f}人\n")
+            f.write(f"估算总出客数: {pass_df['Passengers_Out'].sum():.0f}人\n")
+            f.write(f"净变化: {pass_df['Net_Passengers'].sum():.0f}人\n")
 
-                actual_day_type = day_type_row.iloc[0]['DayType']
-
-                # Skip if no model for this day type
-                if actual_day_type not in self.nhpp_models or self.nhpp_models[actual_day_type].lambda_t is None:
-                    continue
-
-                # Get actual arrival counts
-                date_mask = self.hall_calls['Date'] == date
-                date_data = self.hall_calls[date_mask]
-                slices_counts = date_data.groupby('5min_slice').size()
-
-                # Create full array
-                actual_counts = np.zeros(288, dtype=np.float32)
-                if len(slices_counts) > 0:
-                    indices = slices_counts.index.astype(int)
-                    values = slices_counts.values
-
-                    # Filter indices that are within bounds (0-287)
-                    valid_mask = (indices >= 0) & (indices < 288)
-                    valid_indices = indices[valid_mask]
-                    valid_values = values[valid_mask]
-
-                    # Assign values to corresponding indices
-                    actual_counts[valid_indices] = valid_values
-
-                # Get predictions
-                model = self.nhpp_models[actual_day_type]
-                predicted_rates = model.lambda_t
-
-                # Calculate prediction errors
-                mae = np.mean(np.abs(actual_counts - predicted_rates))
-                rmse = np.sqrt(np.mean((actual_counts - predicted_rates)**2))
-
-                # Avoid division by zero for MAPE
-                total_actual = actual_counts.sum()
-                if total_actual > 0:
-                    mape = np.sum(np.abs(actual_counts - predicted_rates)) / total_actual * 100
-                else:
-                    mape = 0
-
-                validation_results.append({
-                    'Date': date,
-                    'DayType': actual_day_type,
-                    'MAE': mae,
-                    'RMSE': rmse,
-                    'MAPE': mape,
-                    'TotalActual': total_actual,
-                    'TotalPredicted': predicted_rates.sum()
+            # 按小时统计
+            if 'Hour' in pass_df.columns:
+                hourly_passengers = pass_df.groupby('Hour').agg({
+                    'Passengers_In': 'sum',
+                    'Passengers_Out': 'sum'
                 })
 
-            except Exception as e:
-                print(f"Error validating date {date}: {str(e)}")
-                continue
+                if not hourly_passengers.empty:
+                    f.write("\n每小时乘客流量:\n")
+                    for hour in range(24):
+                        if hour in hourly_passengers.index:
+                            in_count = hourly_passengers.loc[hour, 'Passengers_In']
+                            out_count = hourly_passengers.loc[hour, 'Passengers_Out']
+                            f.write(f"  {hour:02d}:00 - {in_count:.0f}人进 / {out_count:.0f}人出\n")
 
-        if not validation_results:
-            print("No validation results!")
-            return None
+            f.write("\n")
 
-        # Summarize validation results
-        val_results_df = pd.DataFrame(validation_results)
+        # 6. 交通模式分布
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'],
+                                                           pd.DataFrame) and 'Traffic_Mode' in data_frames[
+            'time_slot_stats'].columns:
+            ts_stats = data_frames['time_slot_stats']
+            f.write("6. 交通模式分布\n")
+            f.write("-" * 40 + "\n")
 
-        print("\nValidation Results Summary:")
-        print("-" * 40)
+            mode_dist = ts_stats['Traffic_Mode'].value_counts()
+            for mode, count in mode_dist.items():
+                percentage = count / len(ts_stats) * 100
+                avg_calls = ts_stats[ts_stats['Traffic_Mode'] == mode]['Call_Count'].mean()
+                f.write(f"{mode}: {count}槽 ({percentage:.1f}%), 平均呼叫数: {avg_calls:.2f}\n")
 
-        for day_type in ['Weekday', 'Holiday']:
-            type_results = val_results_df[val_results_df['DayType'] == day_type]
-            if len(type_results) > 0:
-                print(f"\n{day_type} ({len(type_results)} days):")
-                print(f"  Mean Absolute Error (MAE): {type_results['MAE'].mean():.3f}")
-                print(f"  Root Mean Square Error (RMSE): {type_results['RMSE'].mean():.3f}")
-                print(f"  Mean Absolute Percentage Error (MAPE): {type_results['MAPE'].mean():.2f}%")
-                print(f"  Avg Daily Passengers - Actual: {type_results['TotalActual'].mean():.1f}")
-                print(f"  Avg Daily Passengers - Predicted: {type_results['TotalPredicted'].mean():.1f}")
+        # 7. 总结与建议
+        f.write("\n7. 总结与建议\n")
+        f.write("-" * 40 + "\n")
 
-        return val_results_df
-
-    def _create_visualizations(self):
-        """Create comprehensive visualizations"""
-        print("\n" + "="*60)
-        print("GENERATING VISUALIZATIONS")
-        print("="*60)
-
-        # Create output directory
-        os.makedirs('figures', exist_ok=True)
-
-        try:
-            self._plot_daily_patterns()
-        except Exception as e:
-            print(f"Error creating daily patterns plot: {str(e)}")
-
-        try:
-            if hasattr(self, 'nhpp_models'):
-                self._plot_nhpp_intensities()
-        except Exception as e:
-            print(f"Error creating NHPP intensities plot: {str(e)}")
-
-        try:
-            if hasattr(self, 'validation_results') and self.validation_results is not None:
-                self._plot_validation_results()
-        except Exception as e:
-            print(f"Error creating validation results plot: {str(e)}")
-
-        print("\nVisualizations saved to 'figures/' directory")
-
-    def _plot_daily_patterns(self):
-        """Plot daily patterns"""
-
-        if self.hall_calls is None or len(self.hall_calls) == 0:
-            print("No data for daily patterns plot")
-            return
-
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-        # Plot 1: Overall hourly distribution
-        ax1 = axes[0, 0]
-        if 'Hour' in self.hall_calls.columns:
-            hourly_counts = self.hall_calls.groupby('Hour').size()
-            ax1.bar(hourly_counts.index, hourly_counts.values, alpha=0.7)
-            ax1.set_xlabel('Hour of Day')
-            ax1.set_ylabel('Number of Calls')
-            ax1.set_title('Overall Hourly Call Distribution')
-            ax1.grid(True, alpha=0.3)
-        else:
-            ax1.text(0.5, 0.5, 'No hour data available',
-                    ha='center', va='center', transform=ax1.transAxes)
-            ax1.set_title('Overall Hourly Call Distribution')
-
-        # Plot 2: Day of week distribution
-        ax2 = axes[0, 1]
-        if 'DayOfWeek' in self.hall_calls.columns:
-            day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            day_counts = self.hall_calls.groupby('DayOfWeek').size()
-            ax2.bar(day_counts.index, day_counts.values, alpha=0.7)
-            ax2.set_xlabel('Day of Week')
-            ax2.set_ylabel('Number of Calls')
-            ax2.set_title('Call Distribution by Day of Week')
-            ax2.set_xticks(range(7))
-            ax2.set_xticklabels(day_names)
-            ax2.grid(True, alpha=0.3)
-        else:
-            ax2.text(0.5, 0.5, 'No day of week data available',
-                    ha='center', va='center', transform=ax2.transAxes)
-            ax2.set_title('Call Distribution by Day of Week')
-
-        # Plot 3: Date progression
-        ax3 = axes[1, 0]
-        if self.day_types is not None and len(self.day_types) > 0:
-            # Get daily counts
-            if 'Date' in self.hall_calls.columns:
-                daily_counts = self.hall_calls.groupby('Date').size().reset_index()
-                daily_counts.columns = ['Date', 'Count']
-                daily_counts = pd.merge(daily_counts, self.day_types, on='Date', how='left')
-
-                # Sort by date
-                daily_counts = daily_counts.sort_values('Date')
-
-                # Plot with different colors for day types
-                colors = {'Weekday': 'blue', 'Holiday': 'orange'}
-                for day_type, color in colors.items():
-                    mask = daily_counts['DayType'] == day_type
-                    if mask.any():
-                        ax3.scatter(daily_counts.loc[mask, 'Date'],
-                                  daily_counts.loc[mask, 'Count'],
-                                  label=day_type, alpha=0.6, color=color, s=50)
-
-                ax3.set_xlabel('Date')
-                ax3.set_ylabel('Daily Calls')
-                ax3.set_title('Daily Call Counts with Day Type Classification')
-                ax3.legend()
-                ax3.grid(True, alpha=0.3)
-                ax3.tick_params(axis='x', rotation=45)
+        # 基于分析结果提供建议
+        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
+            'wait_times'].empty:
+            avg_wait = data_frames['wait_times']['Wait_Time'].mean()
+            if avg_wait > 60:
+                f.write(f"⚠️  平均等待时间({avg_wait:.1f}秒)偏高，建议优化调度策略\n")
+            elif avg_wait > 40:
+                f.write(f"📊 平均等待时间({avg_wait:.1f}秒)可接受，但仍有优化空间\n")
             else:
-                ax3.text(0.5, 0.5, 'No date data available',
-                        ha='center', va='center', transform=ax3.transAxes)
-                ax3.set_title('Daily Call Counts')
-        else:
-            ax3.text(0.5, 0.5, 'No day type classification available',
-                    ha='center', va='center', transform=ax3.transAxes)
-            ax3.set_title('Daily Call Counts')
+                f.write(f"✅ 平均等待时间({avg_wait:.1f}秒)表现良好\n")
 
-        # Plot 4: Floor distribution
-        ax4 = axes[1, 1]
-        if 'Floor' in self.hall_calls.columns:
-            floor_counts = self.hall_calls['Floor'].value_counts().head(20)  # Top 20 floors
-            if len(floor_counts) > 0:
-                ax4.bar(range(len(floor_counts)), floor_counts.values, alpha=0.7)
-                ax4.set_xlabel('Floor Rank')
-                ax4.set_ylabel('Number of Calls')
-                ax4.set_title('Top 20 Floors by Call Frequency')
-                ax4.set_xticks(range(len(floor_counts)))
-                ax4.set_xticklabels(floor_counts.index, rotation=45)
-                ax4.grid(True, alpha=0.3)
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
+        data_frames['time_slot_stats'].empty:
+            # 识别高峰时段
+            peak_hours = []
+            ts_stats = data_frames['time_slot_stats']
+            for hour in range(6, 22):  # 6点到22点
+                hour_calls = ts_stats[ts_stats['Hour'] == hour]['Call_Count'].sum()
+                if hour_calls > ts_stats['Call_Count'].mean() * 2:  # 超过平均2倍
+                    peak_hours.append(hour)
+
+            if peak_hours:
+                f.write(f"🚀 识别到高峰时段: {', '.join([f'{h}:00' for h in peak_hours])}\n")
+                f.write("   建议在高峰时段增加电梯调度频率或预置电梯\n")
+
+        if 'start_floors' in data_frames and isinstance(data_frames['start_floors'], pd.Series) and not data_frames[
+            'start_floors'].empty:
+            top_floor = data_frames['start_floors'].idxmax()
+            top_count = data_frames['start_floors'].max()
+            f.write(f"📍 最热门的起点楼层: {top_floor}层 ({top_count}次呼叫)\n")
+            f.write(f"   建议将空闲电梯预置在该楼层附近\n")
+
+        f.write("\n" + "=" * 60 + "\n")
+        f.write("报告结束\n")
+
+    print(f"✅ 统计报告已保存到: {output_path}")
+
+
+def create_visualizations(data_frames, results_dir):
+    """创建可视化图表"""
+    print("\n[生成可视化图表]")
+
+    try:
+        # 创建第一个图表：关键指标
+        plt.figure(figsize=(15, 10))
+
+        # 子图1: 全天流量曲线
+        plt.subplot(2, 3, 1)
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
+        data_frames['time_slot_stats'].empty:
+            ts_stats = data_frames['time_slot_stats']
+            # 按小时聚合
+            hourly_stats = ts_stats.groupby('Hour')['Call_Count'].sum()
+            plt.plot(hourly_stats.index, hourly_stats.values, marker='o', linewidth=2, color='steelblue')
+            plt.title(f'每小时呼叫量 ({TIME_SLOT_MINUTES}分钟粒度)', fontsize=12)
+            plt.xlabel('小时')
+            plt.ylabel('呼叫次数')
+            plt.xticks(range(0, 24, 2))
+            plt.grid(True, alpha=0.3)
+            plt.fill_between(hourly_stats.index, 0, hourly_stats.values, alpha=0.3, color='steelblue')
+
+        # 子图2: 等待时间分布
+        plt.subplot(2, 3, 2)
+        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
+            'wait_times'].empty:
+            wait_df = data_frames['wait_times']
+            if not wait_df.empty:
+                plt.hist(wait_df['Wait_Time'], bins=30, color='skyblue', edgecolor='black', alpha=0.7)
+                plt.title('等待时间分布', fontsize=12)
+                plt.xlabel('等待时间 (秒)')
+                plt.ylabel('频次')
+                max_wait = min(300, wait_df['Wait_Time'].max() * 1.1)
+                plt.xlim(0, max_wait)
+                mean_wait = wait_df['Wait_Time'].mean()
+                median_wait = wait_df['Wait_Time'].median()
+                plt.axvline(mean_wait, color='red', linestyle='--', label=f'平均: {mean_wait:.1f}s')
+                plt.axvline(median_wait, color='green', linestyle='--', label=f'中位数: {median_wait:.1f}s')
+                plt.legend(fontsize=9)
+
+        # 子图3: 起点楼层热度
+        plt.subplot(2, 3, 3)
+        if 'start_floors' in data_frames and isinstance(data_frames['start_floors'], pd.Series) and not data_frames[
+            'start_floors'].empty:
+            start_floors = data_frames['start_floors']
+            top_10 = start_floors.head(10)
+            if len(top_10) > 0:
+                colors = plt.cm.viridis(np.linspace(0, 0.8, len(top_10)))
+                plt.bar(range(len(top_10)), top_10.values, color=colors, alpha=0.7)
+                plt.title('起点楼层热度 (Top 10)', fontsize=12)
+                plt.xlabel('楼层')
+                plt.ylabel('呼叫次数')
+                plt.xticks(range(len(top_10)), top_10.index, rotation=45)
+
+        # 子图4: 各时段上行比例
+        plt.subplot(2, 3, 4)
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
+        data_frames['time_slot_stats'].empty:
+            ts_stats = data_frames['time_slot_stats']
+            # 按小时计算平均上行比例
+            hourly_up_ratio = ts_stats.groupby('Hour')['Up_Ratio'].mean()
+            plt.bar(hourly_up_ratio.index, hourly_up_ratio.values,
+                    color='orange', alpha=0.7, width=0.8)
+            plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+            plt.title('各小时上行呼叫比例', fontsize=12)
+            plt.xlabel('小时')
+            plt.ylabel('上行比例')
+            plt.xticks(range(0, 24, 2))
+            plt.ylim(0, 1)
+
+        # 子图5: 交通模式分布
+        plt.subplot(2, 3, 5)
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'],
+                                                           pd.DataFrame) and 'Traffic_Mode' in data_frames[
+            'time_slot_stats'].columns:
+            mode_dist = data_frames['time_slot_stats']['Traffic_Mode'].value_counts()
+            if len(mode_dist) > 0:
+                colors = plt.cm.Set3(np.linspace(0, 1, len(mode_dist)))
+                plt.pie(mode_dist.values, labels=mode_dist.index, autopct='%1.1f%%',
+                        colors=colors, startangle=90, textprops={'fontsize': 9})
+                plt.title('交通模式分布', fontsize=12)
+
+        # 子图6: 乘客流量估算
+        plt.subplot(2, 3, 6)
+        if 'passenger_flow' in data_frames and isinstance(data_frames['passenger_flow'], pd.DataFrame) and not \
+        data_frames['passenger_flow'].empty:
+            pass_df = data_frames['passenger_flow']
+            if 'Hour' in pass_df.columns:
+                hourly_pass = pass_df.groupby('Hour').agg({
+                    'Passengers_In': 'sum',
+                    'Passengers_Out': 'sum'
+                })
+                if not hourly_pass.empty:
+                    width = 0.35
+                    x = np.arange(len(hourly_pass))
+                    plt.bar(x - width / 2, hourly_pass['Passengers_In'], width,
+                            label='进入', color='lightblue', alpha=0.7)
+                    plt.bar(x + width / 2, hourly_pass['Passengers_Out'], width,
+                            label='离开', color='lightcoral', alpha=0.7)
+                    plt.title('每小时乘客进出估算', fontsize=12)
+                    plt.xlabel('小时')
+                    plt.ylabel('乘客数')
+                    plt.xticks(x, hourly_pass.index)
+                    plt.legend(fontsize=9)
+
+        plt.tight_layout()
+        save_path = results_dir / 'elevator_analysis_1.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"✅ 分析图表1已保存: {save_path}")
+        plt.show()
+
+    except Exception as e:
+        print(f"❌ 创建图表1时出错: {e}")
+        import traceback
+        traceback.print_exc()
+
+    try:
+        # 创建第二个图表：详细分析
+        plt.figure(figsize=(15, 8))
+
+        # 子图1: 各电梯等待时间对比
+        plt.subplot(2, 3, 1)
+        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
+            'wait_times'].empty:
+            wait_df = data_frames['wait_times']
+            if 'Elevator_ID' in wait_df.columns:
+                elev_means = wait_df.groupby('Elevator_ID')['Wait_Time'].mean().sort_values()
+                if not elev_means.empty:
+                    colors = plt.cm.coolwarm(np.linspace(0, 1, len(elev_means)))
+                    bars = plt.bar(range(len(elev_means)), elev_means.values, color=colors, alpha=0.7)
+                    plt.title('各电梯平均等待时间', fontsize=12)
+                    plt.xlabel('电梯ID')
+                    plt.ylabel('平均等待时间 (秒)')
+                    plt.xticks(range(len(elev_means)), elev_means.index)
+                    # 在柱状图上添加数值
+                    for i, v in enumerate(elev_means.values):
+                        plt.text(i, v + 0.5, f'{v:.1f}', ha='center', va='bottom', fontsize=9)
+
+        # 子图2: 时间槽呼叫量热力图
+        plt.subplot(2, 3, 2)
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
+        data_frames['time_slot_stats'].empty:
+            ts_stats = data_frames['time_slot_stats'].copy()
+            # 限制显示的小时范围
+            ts_stats = ts_stats[ts_stats['Hour'].between(6, 22)]  # 只显示6点到22点
+            if not ts_stats.empty:
+                # 创建小时-分钟的热力图数据
+                heatmap_data = pd.pivot_table(
+                    ts_stats.reset_index(),
+                    values='Call_Count',
+                    index='Hour',
+                    columns='Minute',
+                    aggfunc='mean',
+                    fill_value=0
+                )
+                # 确保分钟列完整
+                all_minutes = list(range(0, 60, TIME_SLOT_MINUTES))
+                for minute in all_minutes:
+                    if minute not in heatmap_data.columns:
+                        heatmap_data[minute] = 0
+                heatmap_data = heatmap_data[all_minutes]
+
+                sns.heatmap(heatmap_data, cmap='YlOrRd', cbar_kws={'label': '平均呼叫次数'})
+                plt.title(f'{TIME_SLOT_MINUTES}分钟槽呼叫量热力图 (6:00-22:00)', fontsize=12)
+                plt.xlabel('分钟')
+                plt.ylabel('小时')
+
+        # 子图3: 等待时间箱线图（按小时）
+        plt.subplot(2, 3, 3)
+        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
+            'wait_times'].empty:
+            wait_df = data_frames['wait_times']
+            wait_df['Hour'] = wait_df['Time_call'].dt.hour
+            # 过滤异常值
+            filtered = wait_df[(wait_df['Wait_Time'] >= 0) & (wait_df['Wait_Time'] <= 300)]
+            if not filtered.empty:
+                box_data = [filtered[filtered['Hour'] == h]['Wait_Time'].values for h in range(24)]
+                positions = range(24)
+                box = plt.boxplot(box_data, positions=positions, widths=0.6,
+                                  patch_artist=True, showfliers=False)
+                # 设置箱体颜色
+                for patch in box['boxes']:
+                    patch.set_facecolor('lightblue')
+                    patch.set_alpha(0.7)
+                plt.title('各小时等待时间分布', fontsize=12)
+                plt.xlabel('小时')
+                plt.ylabel('等待时间 (秒)')
+                plt.xticks(range(0, 24, 2))
+                plt.ylim(0, min(300, filtered['Wait_Time'].max() * 1.1))
+
+        # 子图4: 累计呼叫量
+        plt.subplot(2, 3, 4)
+        if 'hall_calls' in data_frames and isinstance(data_frames['hall_calls'], pd.DataFrame) and not data_frames[
+            'hall_calls'].empty:
+            hall_df = data_frames['hall_calls'].copy()
+            hall_df = hall_df.sort_values('Time')
+            hall_df['Cumulative_Calls'] = range(1, len(hall_df) + 1)
+            plt.plot(hall_df['Time'], hall_df['Cumulative_Calls'], linewidth=2, color='darkgreen')
+            plt.title('累计呼叫量随时间变化', fontsize=12)
+            plt.xlabel('时间')
+            plt.ylabel('累计呼叫次数')
+            plt.grid(True, alpha=0.3)
+
+        # 子图5: 各模式呼叫强度
+        plt.subplot(2, 3, 5)
+        if 'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'],
+                                                           pd.DataFrame) and 'Traffic_Mode' in data_frames[
+            'time_slot_stats'].columns:
+            ts_stats = data_frames['time_slot_stats']
+            mode_avg = ts_stats.groupby('Traffic_Mode')['Call_Count'].mean().sort_values(ascending=False)
+            if not mode_avg.empty:
+                colors = plt.cm.Paired(np.linspace(0, 1, len(mode_avg)))
+                bars = plt.bar(range(len(mode_avg)), mode_avg.values, color=colors, alpha=0.7)
+                plt.title('各交通模式平均呼叫强度', fontsize=12)
+                plt.xlabel('交通模式')
+                plt.ylabel('平均呼叫次数/槽')
+                plt.xticks(range(len(mode_avg)), mode_avg.index, rotation=45, ha='right')
+                # 添加数值标签
+                for i, v in enumerate(mode_avg.values):
+                    plt.text(i, v + 0.1, f'{v:.1f}', ha='center', va='bottom', fontsize=9)
+
+        # 子图6: 等待时间与呼叫量关系
+        plt.subplot(2, 3, 6)
+        if 'wait_times' in data_frames and isinstance(data_frames['wait_times'], pd.DataFrame) and not data_frames[
+            'wait_times'].empty and \
+                'time_slot_stats' in data_frames and isinstance(data_frames['time_slot_stats'], pd.DataFrame) and not \
+        data_frames['time_slot_stats'].empty:
+            wait_df = data_frames['wait_times']
+            ts_stats = data_frames['time_slot_stats']
+
+            # 按时间槽对齐数据
+            wait_df['Time_Slot'] = wait_df['Time_call'].dt.floor(f'{TIME_SLOT_MINUTES}min')
+            wait_by_slot = wait_df.groupby('Time_Slot')['Wait_Time'].mean()
+            calls_by_slot = ts_stats['Call_Count']
+
+            # 找到共同的时间槽
+            common_slots = wait_by_slot.index.intersection(calls_by_slot.index)
+            if len(common_slots) > 0:
+                wait_values = wait_by_slot.loc[common_slots].values
+                call_values = calls_by_slot.loc[common_slots].values
+
+                plt.scatter(call_values, wait_values, alpha=0.6, color='purple', s=30)
+
+                # 添加趋势线
+                if len(common_slots) > 1:
+                    z = np.polyfit(call_values, wait_values, 1)
+                    p = np.poly1d(z)
+                    x_range = np.linspace(min(call_values), max(call_values), 100)
+                    plt.plot(x_range, p(x_range), 'r--', alpha=0.8,
+                             label=f'趋势线: y={z[0]:.2f}x+{z[1]:.2f}')
+                    plt.legend(fontsize=9)
+
+                plt.title('等待时间与呼叫量关系', fontsize=12)
+                plt.xlabel('时间槽呼叫次数')
+                plt.ylabel('平均等待时间 (秒)')
+                plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path = results_dir / 'elevator_analysis_2.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"✅ 分析图表2已保存: {save_path}")
+        plt.show()
+
+    except Exception as e:
+        print(f"❌ 创建图表2时出错: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def main():
+    """主函数"""
+    print("=" * 60)
+    print("电梯数据分析系统")
+    print("=" * 60)
+
+    # 1. 获取数据路径
+    try:
+        data_dir = get_data_path()
+        print(f"📂 数据目录: {data_dir}")
+    except Exception as e:
+        print(e)
+        return
+
+    # 2. 读取所有数据文件
+    print("\n" + "=" * 60)
+    print("加载数据文件")
+    print("=" * 60)
+
+    # 定义要加载的文件
+    files_to_load = [
+        ('hall_calls', 'hall_calls.csv', ['Time', 'Elevator ID', 'Direction', 'Floor']),
+        ('car_calls', 'car_calls.csv', ['Time', 'Elevator ID', 'Floor', 'Action']),
+        ('car_stops', 'car_stops.csv', ['Time', 'Elevator ID', 'Floor', 'Direction']),
+        ('load_changes', 'load_changes.csv', ['Time', 'Elevator ID', 'Floor', 'Load In (kg)', 'Load Out (kg)']),
+        ('car_departures', 'car_departures.csv', ['Time', 'Elevator ID', 'Floor']),
+        ('maintenance_mode', 'maintenance_mode.csv', ['Time', 'Elevator ID', 'Action'])
+    ]
+
+    data_frames = {}
+    for name, file_name, cols in files_to_load:
+        file_path = data_dir / file_name
+        if file_path.exists():
+            df = load_and_clean(file_path, cols=cols)
+            if df is not None:
+                data_frames[name] = df
+                print(f"✅ {name}: {len(df)} 条记录")
             else:
-                ax4.text(0.5, 0.5, 'No floor data available',
-                        ha='center', va='center', transform=ax4.transAxes)
-                ax4.set_title('Floor Distribution')
+                print(f"❌ {name}: 读取失败")
+                data_frames[name] = pd.DataFrame()
         else:
-            ax4.text(0.5, 0.5, 'No floor data available',
-                    ha='center', va='center', transform=ax4.transAxes)
-            ax4.set_title('Floor Distribution')
+            print(f"⚠️  {name}: 文件不存在")
+            data_frames[name] = pd.DataFrame()
 
-        plt.tight_layout()
-        plt.savefig('figures/daily_patterns.png', dpi=150, bbox_inches='tight')
-        plt.savefig('figures/daily_patterns.pdf', bbox_inches='tight')
-        plt.show()
+    # 3. 数据分析和处理
+    print("\n" + "=" * 60)
+    print("数据分析处理")
+    print("=" * 60)
 
-    def _plot_nhpp_intensities(self):
-        """Plot NHPP intensity functions"""
-
-        if not hasattr(self, 'nhpp_models'):
-            return
-
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-
-        for idx, (day_type, model) in enumerate(self.nhpp_models.items()):
-            if model.lambda_t is None:
-                continue
-
-            ax = axes[idx]
-            hours = np.arange(288) / 12
-
-            # Plot intensity function
-            ax.plot(hours, model.lambda_t, 'b-', linewidth=1.5, label='λ(t)')
-
-            # Highlight peak hours
-            ax.axvspan(8, 10, alpha=0.2, color='yellow', label='Morning Peak (8-10)')
-            ax.axvspan(12, 14, alpha=0.2, color='orange', label='Lunch (12-14)')
-            ax.axvspan(17, 19, alpha=0.2, color='red', label='Evening Peak (17-19)')
-
-            ax.set_xlabel('Time of Day (Hours)')
-            ax.set_ylabel('Arrival Rate (passengers/5min)')
-            ax.set_title(f'{day_type} NHPP Intensity Function')
-            ax.legend(loc='upper right')
-            ax.grid(True, alpha=0.3)
-            ax.set_xlim(0, 24)
-            ax.set_ylim(bottom=0)
-
-        plt.tight_layout()
-        plt.savefig('figures/nhpp_intensities.png', dpi=150, bbox_inches='tight')
-        plt.savefig('figures/nhpp_intensities.pdf', bbox_inches='tight')
-        plt.show()
-
-    def _plot_validation_results(self):
-        """Plot validation results"""
-
-        if not hasattr(self, 'validation_results'):
-            return
-
-        val_df = self.validation_results
-
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-        # Plot 1: Actual vs Predicted
-        ax1 = axes[0, 0]
-        colors = {'Weekday': 'blue', 'Holiday': 'orange'}
-
-        for day_type in ['Weekday', 'Holiday']:
-            type_data = val_df[val_df['DayType'] == day_type]
-            if len(type_data) > 0:
-                ax1.scatter(type_data['TotalActual'], type_data['TotalPredicted'],
-                          label=day_type, alpha=0.7, s=60, color=colors[day_type])
-
-        # Add perfect prediction line
-        if len(val_df) > 0:
-            max_val = max(val_df['TotalActual'].max(), val_df['TotalPredicted'].max())
-            ax1.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='Perfect Prediction')
-
-        ax1.set_xlabel('Actual Total Passengers')
-        ax1.set_ylabel('Predicted Total Passengers')
-        ax1.set_title('Actual vs Predicted Daily Totals')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        # Plot 2: Error metrics by day type
-        ax2 = axes[0, 1]
-        error_metrics = ['MAE', 'RMSE']
-        x_pos = np.arange(len(error_metrics))
-        width = 0.35
-
-        for idx, day_type in enumerate(['Weekday', 'Holiday']):
-            type_data = val_df[val_df['DayType'] == day_type]
-            if len(type_data) > 0:
-                means = [type_data[metric].mean() for metric in error_metrics]
-                ax2.bar(x_pos + idx*width, means, width, label=day_type, alpha=0.8)
-
-        ax2.set_xlabel('Error Metric')
-        ax2.set_ylabel('Value')
-        ax2.set_title('Prediction Errors by Day Type')
-        ax2.set_xticks(x_pos + width/2)
-        ax2.set_xticklabels(error_metrics)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3, axis='y')
-
-        # Plot 3: Time series of prediction errors
-        ax3 = axes[1, 0]
-        if len(val_df) > 0:
-            val_df_sorted = val_df.sort_values('Date')
-
-            for day_type in ['Weekday', 'Holiday']:
-                type_data = val_df_sorted[val_df_sorted['DayType'] == day_type]
-                if len(type_data) > 0:
-                    ax3.plot(type_data['Date'], type_data['MAE'],
-                            marker='o', label=f'{day_type} MAE', linewidth=2)
-
-            ax3.set_xlabel('Date')
-            ax3.set_ylabel('Mean Absolute Error (MAE)')
-            ax3.set_title('Prediction Error Over Time')
-            ax3.legend()
-            ax3.grid(True, alpha=0.3)
-            ax3.tick_params(axis='x', rotation=45)
+    # 3.1 估算乘客流量
+    if 'load_changes' in data_frames:
+        passenger_flow = estimate_passenger_count(data_frames['load_changes'])
+        if not passenger_flow.empty:
+            print(f"✅ 乘客流量估算: {len(passenger_flow)} 条记录")
+            data_frames['passenger_flow'] = passenger_flow
         else:
-            ax3.text(0.5, 0.5, 'No validation data available',
-                    ha='center', va='center', transform=ax3.transAxes)
-            ax3.set_title('Prediction Error Over Time')
+            print("⚠️  无法估算乘客流量")
 
-        # Plot 4: Error distribution
-        ax4 = axes[1, 1]
-        error_data = []
-        for _, row in val_df.iterrows():
-            error_data.append({'DayType': row['DayType'], 'MAE': row['MAE']})
-            error_data.append({'DayType': row['DayType'], 'RMSE': row['RMSE']})
-
-        error_df = pd.DataFrame(error_data)
-
-        # Create box plot
-        if len(error_df) > 0:
-            error_melted = error_df.melt(id_vars=['DayType'], value_vars=['MAE', 'RMSE'])
-            error_melted.columns = ['DayType', 'Metric', 'Value']
-
-            import seaborn as sns
-            sns.boxplot(x='Metric', y='Value', hue='DayType', data=error_melted, ax=ax4)
-
-            ax4.set_xlabel('Error Metric')
-            ax4.set_ylabel('Error Value')
-            ax4.set_title('Error Distribution by Day Type')
-            ax4.legend()
-            ax4.grid(True, alpha=0.3, axis='y')
+    # 3.2 计算等待时间（使用简化方法）
+    if 'hall_calls' in data_frames and 'car_stops' in data_frames:
+        wait_times = calculate_wait_times_simple(data_frames['hall_calls'], data_frames['car_stops'])
+        if not wait_times.empty:
+            data_frames['wait_times'] = wait_times
         else:
-            ax4.text(0.5, 0.5, 'No error data available',
-                    ha='center', va='center', transform=ax4.transAxes)
+            print("⚠️  无法计算等待时间")
 
-        plt.tight_layout()
-        plt.savefig('figures/validation_results.png', dpi=150, bbox_inches='tight')
-        plt.savefig('figures/validation_results.pdf', bbox_inches='tight')
-        plt.show()
+    # 3.3 分析流量模式
+    if 'hall_calls' in data_frames:
+        time_slot_stats = analyze_traffic_patterns(data_frames['hall_calls'], TIME_SLOT_MINUTES)
+        if not time_slot_stats.empty:
+            data_frames['time_slot_stats'] = time_slot_stats
 
-    def _save_results(self):
-        """Save analysis results to files"""
+            # 3.4 分类交通模式
+            time_slot_stats = classify_traffic_mode(time_slot_stats)
+        else:
+            print("⚠️  无法分析流量模式")
 
-        # Create output directory
-        os.makedirs('results', exist_ok=True)
+    # 3.5 分析楼层需求
+    start_floors, end_floors = analyze_floor_demand(
+        data_frames.get('hall_calls', pd.DataFrame()),
+        data_frames.get('car_calls', pd.DataFrame())
+    )
+    data_frames['start_floors'] = start_floors
+    data_frames['end_floors'] = end_floors
 
-        # Save day type classification
-        if self.day_types is not None and len(self.day_types) > 0:
-            self.day_types.to_csv('results/day_type_classification.csv', index=False)
-            print("Day type classification saved to 'results/day_type_classification.csv'")
+    # 4. 生成统计报告
+    results_dir = Path('results')
+    results_dir.mkdir(exist_ok=True)
 
-        # Save validation results
-        if hasattr(self, 'validation_results') and self.validation_results is not None:
-            self.validation_results.to_csv('results/validation_results.csv', index=False)
-            print("Validation results saved to 'results/validation_results.csv'")
+    report_path = results_dir / 'elevator_statistics_report.txt'
+    generate_statistics_report(data_frames, report_path)
 
-        # Save NHPP model parameters
-        if hasattr(self, 'nhpp_models'):
-            nhpp_params = {}
-            for day_type, model in self.nhpp_models.items():
-                if model.lambda_t is not None:
-                    nhpp_params[day_type] = model.lambda_t
+    # 5. 可视化分析
+    print("\n" + "=" * 60)
+    print("生成可视化图表")
+    print("=" * 60)
 
-            if nhpp_params:
-                np.savez_compressed('results/nhpp_parameters.npz', **nhpp_params)
-                print("NHPP model parameters saved to 'results/nhpp_parameters.npz'")
+    create_visualizations(data_frames, results_dir)
 
-        print("All results saved to 'results/' directory")
-
-
-class NHPP_Model:
-    """Non-Homogeneous Poisson Process Model"""
-
-    def __init__(self):
-        self.lambda_t = None
-        self.fitted = False
-
-    def fit(self, arrival_data):
-        """Fit NHPP model to arrival data"""
-
-        if len(arrival_data) == 0:
-            print("  Warning: No arrival data to fit!")
-            return
-
-        # Estimate λ(t) as the mean arrival rate at each time slice
-        self.lambda_t = np.mean(arrival_data, axis=0).astype(np.float32)
-
-        # Apply smoothing with moving average
-        window_size = 3  # 15-minute window
-        if window_size > 0 and len(self.lambda_t) > window_size:
-            kernel = np.ones(window_size) / window_size
-            self.lambda_t = np.convolve(self.lambda_t, kernel, mode='same')
-
-        self.fitted = True
-
-    def predict(self, time_slice):
-        """Predict arrival rate for a given time slice"""
-        if not self.fitted:
-            raise ValueError("Model not fitted yet!")
-
-        if time_slice < 0 or time_slice >= 288:
-            raise ValueError(f"Time slice must be between 0 and 287, got {time_slice}")
-
-        return self.lambda_t[time_slice]
+    print("\n" + "=" * 60)
+    print("分析完成！")
+    print(f"📊 统计报告: {report_path}")
+    print(f"📈 图表文件: {results_dir}/")
+    print("=" * 60)
 
 
-# Main execution
 if __name__ == "__main__":
-    # Initialize analyzer
-    analyzer = ElevatorDataAnalyzer(data_folder='./data')
-
-    # Run analysis
-    analyzer.run_analysis()
-
-    print("\nAnalysis complete! Check the 'figures/' and 'results/' directories.")
+    main()
