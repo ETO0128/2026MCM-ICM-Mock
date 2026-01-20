@@ -1,6 +1,6 @@
 """
 MCM Problem B: Elevator Traffic Analysis and NHPP Modeling
-Robust Version - Handles Missing Files and Large Datasets
+Final Robust Version - Fixed Index Error
 Author: [Your Name]
 Date: 2024
 """
@@ -24,7 +24,6 @@ warnings.filterwarnings('ignore')
 # Set style for better visualizations
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
-
 
 class ElevatorDataAnalyzer:
     """Main class for elevator data analysis and NHPP modeling"""
@@ -158,7 +157,7 @@ class ElevatorDataAnalyzer:
         try:
             # First, try to read the file with minimal preprocessing
             df = pd.read_csv(filepath, usecols=usecols, dtype=str, low_memory=False,
-                             on_bad_lines='skip', encoding_errors='ignore')
+                            on_bad_lines='skip', encoding_errors='ignore')
 
             if len(df) == 0:
                 return pd.DataFrame()
@@ -379,7 +378,7 @@ class ElevatorDataAnalyzer:
                 features_list.append(features)
 
                 if i % 10 == 0 and i > 0:
-                    print(f"    Processed {i + 1}/{len(dates)} days")
+                    print(f"    Processed {i+1}/{len(dates)} days")
 
             except Exception as e:
                 print(f"    Error processing date {date}: {str(e)}")
@@ -395,8 +394,8 @@ class ElevatorDataAnalyzer:
 
         # Select features for clustering
         feature_cols = ['MorningPeak_8_10', 'EveningPeak_17_19',
-                        'LunchPeak_12_14', 'NightRatio_20_6',
-                        'UpRatio', 'Peakiness', 'Uniformity']
+                       'LunchPeak_12_14', 'NightRatio_20_6',
+                       'UpRatio', 'Peakiness', 'Uniformity']
 
         # Check if we have the required features
         available_cols = [col for col in feature_cols if col in daily_features.columns]
@@ -467,9 +466,9 @@ class ElevatorDataAnalyzer:
     def _analyze_cluster_characteristics(self, daily_features, day_types):
         """Analyze cluster characteristics"""
 
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print("DAY TYPE CHARACTERISTICS ANALYSIS")
-        print("=" * 60)
+        print("="*60)
 
         # Merge features with day types
         merged_df = pd.merge(daily_features, day_types, on='Date')
@@ -501,9 +500,9 @@ class ElevatorDataAnalyzer:
     def run_analysis(self):
         """Run the complete analysis pipeline"""
 
-        print("=" * 60)
+        print("="*60)
         print("MCM PROBLEM B: ELEVATOR TRAFFIC ANALYSIS")
-        print("=" * 60)
+        print("="*60)
 
         import time
         start_time = time.time()
@@ -548,13 +547,13 @@ class ElevatorDataAnalyzer:
 
         total_time = time.time() - start_time
         print(f"\nAnalysis completed in {total_time:.2f} seconds!")
-        print("=" * 60)
+        print("="*60)
 
     def _fit_nhpp_models(self, train_days=20):
         """Fit NHPP models for Weekday and Holiday patterns"""
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print("FITTING NON-HOMOGENEOUS POISSON PROCESS MODELS")
-        print("=" * 60)
+        print("="*60)
 
         if self.day_types is None or len(self.day_types) == 0:
             print("Error: Day types not classified yet!")
@@ -569,7 +568,7 @@ class ElevatorDataAnalyzer:
             val_dates = []
         else:
             train_days = min(train_days, len(all_dates) - 5)  # Leave at least 5 days for validation
-            val_dates = all_dates[train_days:train_days + 5] if len(all_dates) > train_days else []
+            val_dates = all_dates[train_days:train_days+5] if len(all_dates) > train_days else []
 
         train_dates = all_dates[:train_days]
 
@@ -611,7 +610,7 @@ class ElevatorDataAnalyzer:
         return train_dates, val_dates
 
     def _prepare_arrival_data(self, dates):
-        """Prepare arrival count data for given dates"""
+        """Prepare arrival count data for given dates - FIXED VERSION"""
 
         arrival_counts = []
 
@@ -625,11 +624,19 @@ class ElevatorDataAnalyzer:
 
             # Create full array for all 288 slices
             full_counts = np.zeros(288, dtype=np.float32)
+
             if len(slices_counts) > 0:
+                # Get indices and values
                 indices = slices_counts.index.astype(int)
-                # Ensure indices are within bounds
-                indices = indices[indices < 288]
-                full_counts[indices] = slices_counts.values[indices < len(slices_counts)]
+                values = slices_counts.values
+
+                # Filter indices that are within bounds (0-287)
+                valid_mask = (indices >= 0) & (indices < 288)
+                valid_indices = indices[valid_mask]
+                valid_values = values[valid_mask]
+
+                # Assign values to corresponding indices
+                full_counts[valid_indices] = valid_values
 
             arrival_counts.append(full_counts)
 
@@ -640,9 +647,9 @@ class ElevatorDataAnalyzer:
 
     def _validate_models(self, val_dates):
         """Validate NHPP models on validation data"""
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print("MODEL VALIDATION")
-        print("=" * 60)
+        print("="*60)
 
         if not hasattr(self, 'nhpp_models') or not val_dates:
             print("No models or validation data available!")
@@ -675,8 +682,15 @@ class ElevatorDataAnalyzer:
                 actual_counts = np.zeros(288, dtype=np.float32)
                 if len(slices_counts) > 0:
                     indices = slices_counts.index.astype(int)
-                    indices = indices[indices < 288]
-                    actual_counts[indices] = slices_counts.values[indices < len(slices_counts)]
+                    values = slices_counts.values
+
+                    # Filter indices that are within bounds (0-287)
+                    valid_mask = (indices >= 0) & (indices < 288)
+                    valid_indices = indices[valid_mask]
+                    valid_values = values[valid_mask]
+
+                    # Assign values to corresponding indices
+                    actual_counts[valid_indices] = valid_values
 
                 # Get predictions
                 model = self.nhpp_models[actual_day_type]
@@ -684,7 +698,7 @@ class ElevatorDataAnalyzer:
 
                 # Calculate prediction errors
                 mae = np.mean(np.abs(actual_counts - predicted_rates))
-                rmse = np.sqrt(np.mean((actual_counts - predicted_rates) ** 2))
+                rmse = np.sqrt(np.mean((actual_counts - predicted_rates)**2))
 
                 # Avoid division by zero for MAPE
                 total_actual = actual_counts.sum()
@@ -731,9 +745,9 @@ class ElevatorDataAnalyzer:
 
     def _create_visualizations(self):
         """Create comprehensive visualizations"""
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print("GENERATING VISUALIZATIONS")
-        print("=" * 60)
+        print("="*60)
 
         # Create output directory
         os.makedirs('figures', exist_ok=True)
@@ -777,7 +791,7 @@ class ElevatorDataAnalyzer:
             ax1.grid(True, alpha=0.3)
         else:
             ax1.text(0.5, 0.5, 'No hour data available',
-                     ha='center', va='center', transform=ax1.transAxes)
+                    ha='center', va='center', transform=ax1.transAxes)
             ax1.set_title('Overall Hourly Call Distribution')
 
         # Plot 2: Day of week distribution
@@ -794,7 +808,7 @@ class ElevatorDataAnalyzer:
             ax2.grid(True, alpha=0.3)
         else:
             ax2.text(0.5, 0.5, 'No day of week data available',
-                     ha='center', va='center', transform=ax2.transAxes)
+                    ha='center', va='center', transform=ax2.transAxes)
             ax2.set_title('Call Distribution by Day of Week')
 
         # Plot 3: Date progression
@@ -815,8 +829,8 @@ class ElevatorDataAnalyzer:
                     mask = daily_counts['DayType'] == day_type
                     if mask.any():
                         ax3.scatter(daily_counts.loc[mask, 'Date'],
-                                    daily_counts.loc[mask, 'Count'],
-                                    label=day_type, alpha=0.6, color=color, s=50)
+                                  daily_counts.loc[mask, 'Count'],
+                                  label=day_type, alpha=0.6, color=color, s=50)
 
                 ax3.set_xlabel('Date')
                 ax3.set_ylabel('Daily Calls')
@@ -826,11 +840,11 @@ class ElevatorDataAnalyzer:
                 ax3.tick_params(axis='x', rotation=45)
             else:
                 ax3.text(0.5, 0.5, 'No date data available',
-                         ha='center', va='center', transform=ax3.transAxes)
+                        ha='center', va='center', transform=ax3.transAxes)
                 ax3.set_title('Daily Call Counts')
         else:
             ax3.text(0.5, 0.5, 'No day type classification available',
-                     ha='center', va='center', transform=ax3.transAxes)
+                    ha='center', va='center', transform=ax3.transAxes)
             ax3.set_title('Daily Call Counts')
 
         # Plot 4: Floor distribution
@@ -847,11 +861,11 @@ class ElevatorDataAnalyzer:
                 ax4.grid(True, alpha=0.3)
             else:
                 ax4.text(0.5, 0.5, 'No floor data available',
-                         ha='center', va='center', transform=ax4.transAxes)
+                        ha='center', va='center', transform=ax4.transAxes)
                 ax4.set_title('Floor Distribution')
         else:
             ax4.text(0.5, 0.5, 'No floor data available',
-                     ha='center', va='center', transform=ax4.transAxes)
+                    ha='center', va='center', transform=ax4.transAxes)
             ax4.set_title('Floor Distribution')
 
         plt.tight_layout()
@@ -913,7 +927,7 @@ class ElevatorDataAnalyzer:
             type_data = val_df[val_df['DayType'] == day_type]
             if len(type_data) > 0:
                 ax1.scatter(type_data['TotalActual'], type_data['TotalPredicted'],
-                            label=day_type, alpha=0.7, s=60, color=colors[day_type])
+                          label=day_type, alpha=0.7, s=60, color=colors[day_type])
 
         # Add perfect prediction line
         if len(val_df) > 0:
@@ -936,12 +950,12 @@ class ElevatorDataAnalyzer:
             type_data = val_df[val_df['DayType'] == day_type]
             if len(type_data) > 0:
                 means = [type_data[metric].mean() for metric in error_metrics]
-                ax2.bar(x_pos + idx * width, means, width, label=day_type, alpha=0.8)
+                ax2.bar(x_pos + idx*width, means, width, label=day_type, alpha=0.8)
 
         ax2.set_xlabel('Error Metric')
         ax2.set_ylabel('Value')
         ax2.set_title('Prediction Errors by Day Type')
-        ax2.set_xticks(x_pos + width / 2)
+        ax2.set_xticks(x_pos + width/2)
         ax2.set_xticklabels(error_metrics)
         ax2.legend()
         ax2.grid(True, alpha=0.3, axis='y')
@@ -955,7 +969,7 @@ class ElevatorDataAnalyzer:
                 type_data = val_df_sorted[val_df_sorted['DayType'] == day_type]
                 if len(type_data) > 0:
                     ax3.plot(type_data['Date'], type_data['MAE'],
-                             marker='o', label=f'{day_type} MAE', linewidth=2)
+                            marker='o', label=f'{day_type} MAE', linewidth=2)
 
             ax3.set_xlabel('Date')
             ax3.set_ylabel('Mean Absolute Error (MAE)')
@@ -965,7 +979,7 @@ class ElevatorDataAnalyzer:
             ax3.tick_params(axis='x', rotation=45)
         else:
             ax3.text(0.5, 0.5, 'No validation data available',
-                     ha='center', va='center', transform=ax3.transAxes)
+                    ha='center', va='center', transform=ax3.transAxes)
             ax3.set_title('Prediction Error Over Time')
 
         # Plot 4: Error distribution
@@ -992,7 +1006,7 @@ class ElevatorDataAnalyzer:
             ax4.grid(True, alpha=0.3, axis='y')
         else:
             ax4.text(0.5, 0.5, 'No error data available',
-                     ha='center', va='center', transform=ax4.transAxes)
+                    ha='center', va='center', transform=ax4.transAxes)
 
         plt.tight_layout()
         plt.savefig('figures/validation_results.png', dpi=150, bbox_inches='tight')
